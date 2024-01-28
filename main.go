@@ -3,8 +3,11 @@ package main
 import (
 	"fmt"
 	"log"
+	"os"
+	"os/signal"
 	"regexp"
 	"slices"
+	"syscall"
 	"time"
 
 	"github.com/ka2n/go-idle"
@@ -67,54 +70,71 @@ func notify(name string) {
 	var now = time.Now().UnixMilli()
 	var diff = now - last
 	// pp.Println(name)
-	fmt.Printf("- [\"%s\",%d]\n", current_workspace, diff)
+	fmt.Printf("- [\"%s\",%d,%d]\n", current_workspace, last, diff)
+	if err := DBNotify(current_workspace, last, diff); err != nil {
+		log.Println(err)
+	}
 	current_workspace = name
 	last = now
 }
 
 func main() {
+	OpenDB()
+
 	last = time.Now().UnixMilli()
-	fmt.Println("-", last)
 
-	rec := i3.Subscribe("workspace", "window")
-	wss, err := i3.GetWorkspaces()
-	if err != nil {
-		log.Fatal("can't get workspaces")
-	}
+	// Get the current workspace to get going
+	{
+		wss, err := i3.GetWorkspaces()
+		if err != nil {
+			log.Fatal("can't get workspaces")
+		}
 
-	idx := slices.IndexFunc(wss, func(w i3.Workspace) bool { return w.Focused })
-	if idx > -1 {
-		current_workspace = re_num_replace.ReplaceAllString(wss[idx].Name, "")
+		idx := slices.IndexFunc(wss, func(w i3.Workspace) bool { return w.Focused })
+		if idx > -1 {
+			current_workspace = re_num_replace.ReplaceAllString(wss[idx].Name, "")
+		}
+
 	}
 
 	go pollIdle()
 
-	// i3.RunCommand()
+	// We still want to emit something if we were interrupted or terminated.
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		var sig = <-signalChan
+		notify("")
+		db.Close()
+		if sig == syscall.SIGINT {
+			os.Exit(130)
+		}
+		os.Exit(0)
+	}()
 
+	rec := i3.Subscribe("workspace", "window")
 	for rec.Next() {
 		evt := rec.Event()
-		// pp.Println(evt)
 
 		switch v := evt.(type) {
 
 		case *i3.WorkspaceEvent:
-			// pp.Println(v.Change)
 			if v.Change == "focus" {
 				notify(v.Current.Name)
 			}
-			// pp.Println("Workspace: ", v.Current.Name)
 
 		case *i3.WindowEvent:
+			// This is how we detect that a scratchpad window was put forth
 			if v.Container.ScratchpadState != "none" {
 				var now = time.Now().UnixMilli()
 				var diff = now - last
 				if diff > 20 {
-					// Usually, the scratchpad event is called right after the workspace focus event
-					// so we only take it into account if it's been more than 20 ms
+					// Usually, the scratchpad event is called right after the workspace focus event when the window is hidden back to the scratchpad so we arbitrarily take it into account only if it's been more than 20 ms
 					notify("__i3_scratch")
 				}
 			}
 
+			// Special rule for VScode, but should probably be in a config file somewhere ; if a window matching this regexp is focused to, the workspace gets the name as number: project name
 			if re_num.MatchString(current_workspace) {
 				var title = v.Container.WindowProperties.Title
 				var groups = re_vscode.FindStringSubmatch(title)
